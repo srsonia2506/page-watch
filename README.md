@@ -12,8 +12,8 @@ All target details (page URL, item filter, notification topic) are repository **
    | Name | Value |
    |---|---|
    | `NTFY_TOPIC` | your topic name |
-   | `PAGE_URL` | the page to read |
-   | `BUY_URL` | *(optional)* the link the notification opens |
+   | `PAGE_URL` | the page(s) to read, one per line |
+   | `BUY_URL` | *(optional)* override the link the notification opens |
    | `WATCH` | *(optional)* regex of item names to watch |
 4. Go to Actions → **check** → **Run workflow**. You should get a test push within a minute. After that it runs on its own.
 

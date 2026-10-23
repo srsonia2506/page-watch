@@ -2,13 +2,13 @@ name: check
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 min (GitHub may delay runs a few minutes when busy)
+    - cron: "17 * * * *"    # hourly backup; cron-job.org triggers the 5-min checks
   workflow_dispatch:         # lets you hit "Run workflow" manually to test
     inputs:
       test_ping:
         description: "Send a test notification"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write            # to save state.json so you're pinged once per opening, not every 5 min

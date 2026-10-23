@@ -8,8 +8,8 @@ All target details live in secrets so nothing identifying is in the repo or logs
 
 Config (environment variables):
   NTFY_TOPIC   required - your secret ntfy topic name
-  PAGE_URL     required - the page to read
-  BUY_URL      optional - link the notification opens (default: PAGE_URL)
+  PAGE_URL     required - page(s) to read; put several on separate lines or separate with spaces
+  BUY_URL      optional - link the notification opens (default: that item's event page)
   WATCH        optional - regex of item names to watch (default: all)
   STATE_FILE   optional - default state.json
   VERBOSE      optional - "true" prints item names (only use locally, never in public logs)
@@ -19,10 +19,11 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 
-PAGE_URL = os.environ.get("PAGE_URL", "").strip()
-BUY_URL = os.environ.get("BUY_URL", "").strip() or PAGE_URL
+PAGE_URLS = os.environ.get("PAGE_URL", "").split()
+BUY_URL = os.environ.get("BUY_URL", "").strip()
 WATCH = re.compile(os.environ.get("WATCH") or ".")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
@@ -31,8 +32,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
 
-def fetch_items():
-    req = urllib.request.Request(PAGE_URL, headers={"User-Agent": UA, "Accept": "text/html"})
+def fetch_items(page_url):
+    req = urllib.request.Request(page_url, headers={"User-Agent": UA, "Accept": "text/html"})
     with urllib.request.urlopen(req, timeout=30) as r:
         html = r.read().decode("utf-8", "replace")
     m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
@@ -50,21 +51,24 @@ def fetch_items():
         items[t["name"]] = left
     if not items:
         raise RuntimeError("no items matched WATCH")
-    return items
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(page_url))
+    event_link = f"{origin}/event/{event['url']}" if event.get("url") else page_url
+    return event.get("name", ""), event_link, items
 
 
-def key(name):
+def key(page_url, name):
     # state.json is committed to the repo, so store a hash instead of the name
-    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(f"{page_url}|{name}".encode("utf-8")).hexdigest()[:12]
 
 
-def notify(title, message, priority="urgent", tags="rotating_light"):
+def notify(title, message, priority="urgent", tags="rotating_light", link=""):
     if not NTFY_TOPIC:
         print("NTFY_TOPIC not set, would have sent:", title, "-", message)
         return
     headers = {"Title": title, "Priority": priority, "Tags": tags}
-    if BUY_URL:
-        headers.update({"Click": BUY_URL, "Actions": f"view, Open, {BUY_URL}"})
+    link = BUY_URL or link
+    if link:
+        headers.update({"Click": link, "Actions": f"view, Open, {link}"})
     req = urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}",
                                  data=message.encode("utf-8"), headers=headers)
     urllib.request.urlopen(req, timeout=30).read()
@@ -84,40 +88,46 @@ def save(state):
 
 
 def main():
-    if not PAGE_URL:
+    if not PAGE_URLS:
         sys.exit("PAGE_URL not set")
     if os.environ.get("TEST_PING") == "true":
         notify("Watcher test", "Notifications work! You'll get a ping like this when a spot opens.",
                priority="default", tags="tada")
         print("test ping sent")
     state = load_state()
-    try:
-        items = fetch_items()
-    except Exception as e:
-        print("CHECK FAILED:", type(e).__name__)
-        fails = state.get("_fails", 0) + 1
-        state["_fails"] = fails
-        if fails == 6:  # ~30 min of failures in a row: tell you once
-            notify("Watcher can't read the page", str(e)[:200], priority="default", tags="warning")
-        save(state)
-        sys.exit(1)
-
     was_open = set(state.get("open", []))
-    now_open = {key(n) for n, left in items.items() if left > 0}
-    new = sorted(n for n, left in items.items() if left > 0 and key(n) not in was_open)
+    now_open, failed = set(), []
 
-    print(f"watched: {len(items)}  available: {len(now_open)}  newly available: {len(new)}")
-    if VERBOSE:
-        for n, left in sorted(items.items()):
-            print(f"{'OPEN ' if left > 0 else 'sold '} {left:>5}  {n}")
+    for i, page_url in enumerate(PAGE_URLS, 1):
+        try:
+            event_name, event_link, items = fetch_items(page_url)
+        except Exception as e:
+            print(f"page {i}: CHECK FAILED:", type(e).__name__)
+            failed.append(f"page {i}: {str(e)[:150]}")
+            # keep this page's previous state so a blip doesn't cause a repeat ping
+            now_open |= {k for k in was_open if k.startswith(f"{i}:")}
+            continue
+        opened = {f"{i}:{key(page_url, n)}" for n, left in items.items() if left > 0}
+        new = sorted(n for n, left in items.items()
+                     if left > 0 and f"{i}:{key(page_url, n)}" not in was_open)
+        now_open |= opened
+        print(f"page {i}: watched: {len(items)}  available: {len(opened)}  newly available: {len(new)}")
+        if VERBOSE:
+            for n, left in sorted(items.items()):
+                print(f"  {'OPEN ' if left > 0 else 'sold '} {left:>5}  {n}")
+        if new:
+            body = "\n".join(f"{n}: {items[n]} left" for n in new)
+            notify(f"Spot open! {event_name}".strip(), body + "\nTap to grab it.", link=event_link)
+            print(f"page {i}: alert sent")
 
-    if new:
-        notify("Spot open!", "\n".join(f"{n}: {items[n]} left" for n in new) + "\nTap to grab it.")
-        print("alert sent")
-    if state.get("_fails", 0) >= 6:
+    fails = state.get("_fails", 0) + 1 if failed else 0
+    if fails == 6:  # ~30 min of failures in a row: tell you once
+        notify("Watcher can't read the page", "\n".join(failed), priority="default", tags="warning")
+    if not failed and state.get("_fails", 0) >= 6:
         notify("Watcher is back", "Reading the page again.", priority="low", tags="white_check_mark")
-
-    save({"open": sorted(now_open)})
+    save({"open": sorted(now_open), **({"_fails": fails} if fails else {})})
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
